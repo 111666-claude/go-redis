@@ -448,27 +448,37 @@ func (r *Reader) readVerb(line []byte) (string, error) {
 	return s[4:], nil
 }
 
+// maxPreallocElements bounds the capacity allocated for an aggregate reply
+// before its first element has been read. The declared element count comes
+// straight from the wire, and a corrupt or malicious count (a desynchronized
+// stream can decode any integer here) must not force a multi-gigabyte
+// allocation: preallocating make([]interface{}, n) for a huge n ends in an
+// unrecoverable runtime out-of-memory throw, killing the process. Elements
+// are appended instead, so memory grows only as data actually arrives; a
+// truncated frame fails on read long before the allocation does.
+const maxPreallocElements = 1024
+
 func (r *Reader) readSlice(line []byte) ([]interface{}, error) {
 	n, err := replyLen(line)
 	if err != nil {
 		return nil, err
 	}
 
-	val := make([]interface{}, n)
-	for i := 0; i < len(val); i++ {
+	val := make([]interface{}, 0, min(n, maxPreallocElements))
+	for i := 0; i < n; i++ {
 		v, err := r.ReadReply()
 		if err != nil {
 			if err == Nil {
-				val[i] = nil
+				val = append(val, nil)
 				continue
 			}
 			if isServerError(err) {
-				val[i] = err
+				val = append(val, err)
 				continue
 			}
 			return nil, err
 		}
-		val[i] = v
+		val = append(val, v)
 	}
 	return val, nil
 }
@@ -478,7 +488,7 @@ func (r *Reader) readMap(line []byte) (map[interface{}]interface{}, error) {
 	if err != nil {
 		return nil, err
 	}
-	m := make(map[interface{}]interface{}, n)
+	m := make(map[interface{}]interface{}, min(n, maxPreallocElements))
 	for i := 0; i < n; i++ {
 		k, err := r.ReadReply()
 		if err != nil {
@@ -872,6 +882,17 @@ func replyLen(line []byte) (n int, err error) {
 
 	if n < -1 {
 		return 0, fmt.Errorf("redis: invalid reply: %q", line)
+	}
+
+	// Every sized payload is consumed together with its trailing CRLF, so all
+	// readers compute n+2 from this value. Reject lengths for which n+2
+	// overflows int: the wrap used to panic makeslice (n+2 < 0), and it made
+	// io.CopyN/Discard treat the count as "nothing to read" — reporting
+	// success while the unread payload stayed in the stream to be decoded as
+	// the NEXT caller's reply. Such a frame is never valid; failing here lets
+	// the caller drop the connection instead of desynchronizing it.
+	if n > math.MaxInt-2 {
+		return 0, fmt.Errorf("redis: invalid reply length: %q", line)
 	}
 
 	switch line[0] {
